@@ -106,8 +106,103 @@ function findUserTeam(data, userId) {
   return null;
 }
 
+// Helper function to update message and disable buttons
+async function disableInviteButtons(client, invite, statusText) {
+  if (!invite.messageChannelId || !invite.messageId) return;
+
+  try {
+    const channel = await client.channels.fetch(invite.messageChannelId).catch(()=>null);
+    if (!channel) return;
+    const message = await channel.messages.fetch(invite.messageId).catch(()=>null);
+    if (!message) return;
+
+    // disabled buttons
+    const acceptBtn = new ButtonBuilder()
+      .setCustomId(`invite_accept::${invite.id}`)
+      .setLabel("Accept")
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(true);
+
+    const declineBtn = new ButtonBuilder()
+      .setCustomId(`invite_decline::${invite.id}`)
+      .setLabel("Decline")
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(true);
+
+    const row = new ActionRowBuilder().addComponents(acceptBtn, declineBtn);
+
+    // If original message had an embed, clone and update it; otherwise create a small one
+    let newEmbed;
+    if (message.embeds && message.embeds[0]) {
+      const old = message.embeds[0];
+      newEmbed = new EmbedBuilder(old.data || {})
+        .setColor(statusText.toLowerCase().includes('accept') ? 0x00ff00 : statusText.toLowerCase().includes('decline') ? 0xff0000 : 0x808080)
+        .setFooter({ text: statusText });
+    } else {
+      newEmbed = new EmbedBuilder()
+        .setTitle("Invite")
+        .setDescription(statusText)
+        .setColor(0x808080)
+        .setFooter({ text: statusText });
+    }
+
+    await message.edit({ embeds: [newEmbed], components: [row] }).catch(()=>null);
+  } catch (err) {
+    console.warn("Failed to disable buttons:", err);
+  }
+}
+
+// Helper function to remove buttons completely (for expired invites)
+async function removeInviteButtons(client, invite) {
+  if (!invite.messageChannelId || !invite.messageId) return;
+
+  try {
+    const channel = await client.channels.fetch(invite.messageChannelId).catch(()=>null);
+    if (!channel) return;
+    const message = await channel.messages.fetch(invite.messageId).catch(()=>null);
+    if (!message) return;
+
+    let newEmbed;
+    if (message.embeds && message.embeds[0]) {
+      const old = message.embeds[0];
+      newEmbed = new EmbedBuilder(old.data || {})
+        .setColor(0x808080)
+        .setFooter({ text: "This invite has expired (24 hours)" });
+    } else {
+      newEmbed = new EmbedBuilder()
+        .setTitle("Invite expired")
+        .setDescription("This invite has expired (24 hours)")
+        .setColor(0x808080)
+        .setFooter({ text: "This invite has expired (24 hours)" });
+    }
+
+    await message.edit({ embeds: [newEmbed], components: [] }).catch(()=>null);
+  } catch (err) {
+    console.warn("Failed to remove buttons:", err);
+  }
+}
+
+// Clean up expired invites and update their messages
+async function cleanupExpiredInvites(client, data) {
+  const now = new Date();
+  const expiredInvites = data.invites.filter(invite => {
+    const inviteDate = new Date(invite.createdAt);
+    const hoursDiff = (now - inviteDate) / (1000 * 60 * 60);
+    return invite.status === "pending" && hoursDiff >= 24;
+  });
+
+  for (const invite of expiredInvites) {
+    invite.status = "expired";
+    await removeInviteButtons(client, invite);
+  }
+
+  if (expiredInvites.length > 0) {
+    await saveData(data);
+    console.log(`Cleaned up ${expiredInvites.length} expired invites`);
+  }
+}
+
 // ---------- Commands ----------
-// ---------- Commands (replace the old commands block with this) ----------
 const commands = [
   new SlashCommandBuilder()
     .setName("teamcreate")
@@ -128,6 +223,10 @@ const commands = [
   new SlashCommandBuilder()
     .setName("teamleave")
     .setDescription("Leave the team you're currently in."),
+  new SlashCommandBuilder()
+    .setName("teamnamechange")
+    .setDescription("Change your team's name (leader only).")
+    .addStringOption(opt => opt.setName("name").setDescription("New team name").setRequired(true)),
   new SlashCommandBuilder()
     .setName("accept")
     .setDescription("Accept a pending team invite.")
@@ -163,6 +262,16 @@ const client = new Client({
 
 client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  // Set up cleanup interval (every 30 minutes)
+  setInterval(async () => {
+    try {
+      const data = await loadData();
+      await cleanupExpiredInvites(client, data);
+    } catch (err) {
+      console.error("Error during cleanup:", err);
+    }
+  }, 30 * 60 * 1000); // 30 minutes
 });
 
 // Utility: create role + private channels and return ids
@@ -315,6 +424,12 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.reply({ content: "You are already in a team. Leave your current team before creating a new one.", ephemeral: true });
         }
 
+        // check duplicate team name (case-insensitive)
+        const nameTaken = Object.values(data.teams).some(t => t.name.toLowerCase() === name.toLowerCase());
+        if (nameTaken) {
+          return interaction.reply({ content: `A team named "${name}" already exists. Please choose a different name.`, ephemeral: true });
+        }
+
         // create team data
         const teamId = userId;
         const team = {
@@ -420,7 +535,29 @@ client.on("interactionCreate", async (interaction) => {
         const declineBtn = new ButtonBuilder().setCustomId(`invite_decline::${inviteId}`).setLabel("Decline").setStyle(ButtonStyle.Danger);
         const row = new ActionRowBuilder().addComponents(acceptBtn, declineBtn);
 
-        await interaction.reply({ content: `<@${targetId}>`, embeds: [inviteEmbed], components: [row] });
+        // Send the invite message and fetch the message object so we can store its id
+        const message = await interaction.reply({ content: `<@${targetId}>`, embeds: [inviteEmbed], components: [row], fetchReply: true });
+
+        // Store message info for later button management
+        invite.messageChannelId = interaction.channelId;
+        invite.messageId = message.id;
+        await saveData(data);
+
+        // Schedule in-memory removal of buttons after exactly 24 hours (best-effort; cleanup task remains as fallback)
+        setTimeout(async () => {
+          try {
+            const fresh = await loadData();
+            const inv = fresh.invites.find(i => i.id === inviteId);
+            if (inv && inv.status === "pending") {
+              inv.status = "expired";
+              await saveData(fresh);
+              await removeInviteButtons(client, inv);
+            }
+          } catch (err) {
+            console.warn("Scheduled expiry failed:", err);
+          }
+        }, 24 * 60 * 60 * 1000); // 24 hours
+
         return;
       }
 
@@ -468,6 +605,13 @@ client.on("interactionCreate", async (interaction) => {
 
           // proceed with deletion: remove invites, delete channels, delete team
           // remove invites related to this team
+          const teamInvites = data.invites.filter(inv => inv.teamId === leaderTeam.teamId);
+          for (const invite of teamInvites) {
+            if (invite.status === "pending") {
+              invite.status = "cancelled";
+              await disableInviteButtons(client, invite, "Team was deleted");
+            }
+          }
           data.invites = data.invites.filter(inv => inv.teamId !== leaderTeam.teamId);
           await saveData(data);
 
@@ -552,6 +696,72 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ embeds: [embed], ephemeral: true });
       }
 
+      // ------------------ teamnamechange ------------------
+      if (interaction.commandName === "teamnamechange") {
+        const newName = interaction.options.getString("name", true).trim();
+        if (!newName) return interaction.reply({ content: "Please provide a new team name.", ephemeral: true });
+
+        const leaderTeam = data.teams[userId];
+        if (!leaderTeam) return interaction.reply({ content: "You are not a team leader.", ephemeral: true });
+        if (leaderTeam.leaderId !== userId) return interaction.reply({ content: "Only the team leader may change the team name.", ephemeral: true });
+
+        // check duplicate name (case-insensitive) among other teams
+        const taken = Object.values(data.teams).some(t => t.teamId !== leaderTeam.teamId && t.name.toLowerCase() === newName.toLowerCase());
+        if (taken) {
+          return interaction.reply({ content: `A team named "${newName}" already exists. Please pick a different name.`, ephemeral: true });
+        }
+
+        const oldName = leaderTeam.name;
+        leaderTeam.name = newName;
+
+        // Attempt to rename role and channels if in a guild
+        if (interaction.guild) {
+          const guildObj = interaction.guild;
+          const base = sanitizeChannelName(newName);
+
+          // rename role
+          if (leaderTeam.roleId) {
+            try {
+              const role = guildObj.roles.cache.get(leaderTeam.roleId) || await guildObj.roles.fetch(leaderTeam.roleId).catch(()=>null);
+              if (role) {
+                await role.setName(`team-${base}`).catch(err => { console.warn("Failed to rename role:", err); });
+              }
+            } catch (err) {
+              console.warn("Role rename error:", err);
+            }
+          }
+
+          // rename text channel
+          if (leaderTeam.textChannelId) {
+            try {
+              const tch = guildObj.channels.cache.get(leaderTeam.textChannelId) || await guildObj.channels.fetch(leaderTeam.textChannelId).catch(()=>null);
+              if (tch) await tch.setName(`${base}-chat`).catch(err => { console.warn("Failed to rename text channel:", err); });
+            } catch (err) {
+              console.warn("Text channel rename error:", err);
+            }
+          }
+
+          // rename voice channel
+          if (leaderTeam.voiceChannelId) {
+            try {
+              const vch = guildObj.channels.cache.get(leaderTeam.voiceChannelId) || await guildObj.channels.fetch(leaderTeam.voiceChannelId).catch(()=>null);
+              if (vch) await vch.setName(`${base}-vc`).catch(err => { console.warn("Failed to rename voice channel:", err); });
+            } catch (err) {
+              console.warn("Voice channel rename error:", err);
+            }
+          }
+        }
+
+        await saveData(data);
+
+        const embed = new EmbedBuilder()
+          .setTitle("Team renamed")
+          .setDescription(`**${oldName}** → **${leaderTeam.name}**`)
+          .setTimestamp();
+
+        return interaction.reply({ embeds: [embed] });
+      }
+
       // ------------------ accept / decline (slash) ------------------
       if (interaction.commandName === "accept" || interaction.commandName === "decline") {
         const isAccept = interaction.commandName === "accept";
@@ -583,6 +793,7 @@ client.on("interactionCreate", async (interaction) => {
             invite.status = "declined";
             invite.declinedUntil = plusDaysISO(1);
             await saveData(data);
+            await disableInviteButtons(client, invite, "Team was full when trying to accept");
             // notify leader
             if (interaction.guild) {
               const leaderUser = await client.users.fetch(team.leaderId).catch(()=>null);
@@ -595,6 +806,7 @@ client.on("interactionCreate", async (interaction) => {
           team.members.push(userId);
           invite.status = "accepted";
           await saveData(data);
+          await disableInviteButtons(client, invite, "Invite accepted");
 
           // grant channel access
           if (interaction.guild) await grantMemberChannelAccess(interaction.guild, team, userId);
@@ -661,14 +873,23 @@ client.on("interactionCreate", async (interaction) => {
   if (!team) {
     invite.status = "declined";
     await saveData(data);
+    await disableInviteButtons(interaction.client, invite, "Team no longer exists");
     return interaction.reply({ content: "The team no longer exists.", ephemeral: true });
   }
 
   if (action === "invite_accept") {
+    if (findUserTeam(data, interaction.user.id)) {
+      invite.status = "declined";
+      await saveData(data);
+      await disableInviteButtons(interaction.client, invite, "User already in another team");
+      return interaction.reply({ content: "You are already in a team. Leave your current team before joining another.", ephemeral: true });
+    }
+
     if (team.members.length >= 4) {
       invite.status = "declined";
       invite.declinedUntil = plusDaysISO(1);
       await saveData(data);
+      await disableInviteButtons(interaction.client, invite, "Team was full");
       // notify leader
       const leaderUser = await client.users.fetch(team.leaderId).catch(()=>null);
       if (leaderUser) leaderUser.send(`<@${interaction.user.id}> tried to accept your invite to **${team.name}**, but the team was full.`).catch(()=>null);
@@ -679,6 +900,7 @@ client.on("interactionCreate", async (interaction) => {
     team.members.push(interaction.user.id);
     invite.status = "accepted";
     await saveData(data);
+    await disableInviteButtons(interaction.client, invite, "Invite accepted ✅");
 
     // grant channel access
     if (interaction.guild) await grantMemberChannelAccess(interaction.guild, team, interaction.user.id);
@@ -694,6 +916,7 @@ client.on("interactionCreate", async (interaction) => {
     invite.status = "declined";
     invite.declinedUntil = plusDaysISO(1);
     await saveData(data);
+    await disableInviteButtons(interaction.client, invite, "Invite declined ❌");
 
     // notify leader
     const leaderUser = await client.users.fetch(team.leaderId).catch(()=>null);
